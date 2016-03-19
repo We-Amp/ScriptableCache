@@ -1,0 +1,28 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio 14
+VisualStudioVersion = 14.0.24720.0
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "WeAmp.EasyCacheDropin", "WeAmp.EasyCacheDropin\WeAmp.EasyCacheDropin.csproj", "{862AEF30-AAB1-4524-B963-F9BE4B8CBE1C}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "WebApplication1", "WebApplication1\WebApplication1.csproj", "{EE6F2CCC-D1B9-47D6-A232-1169F3E38A47}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{862AEF30-AAB1-4524-B963-F9BE4B8CBE1C}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{862AEF30-AAB1-4524-B963-F9BE4B8CBE1C}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{862AEF30-AAB1-4524-B963-F9BE4B8CBE1C}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{862AEF30-AAB1-4524-B963-F9BE4B8CBE1C}.Release|Any CPU.Build.0 = Release|Any CPU
+		{EE6F2CCC-D1B9-47D6-A232-1169F3E38A47}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{EE6F2CCC-D1B9-47D6-A232-1169F3E38A47}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{EE6F2CCC-D1B9-47D6-A232-1169F3E38A47}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{EE6F2CCC-D1B9-47D6-A232-1169F3E38A47}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+EndGlobal
