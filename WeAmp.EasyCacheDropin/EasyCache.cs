@@ -7,6 +7,10 @@ using System.Text;
 using System.Web;
 using CSharpTest.Net.Collections;
 using System.Diagnostics;
+using Microsoft.CSharp;
+using System.CodeDom.Compiler;
+using System.Reflection;
+
 
 namespace WeAmp.EasyCacheDropin
 {
@@ -43,6 +47,7 @@ namespace WeAmp.EasyCacheDropin
         CSharpTest.Net.Collections.LurchTable<string, CacheItem> lru_;
         public MemoryCache(string name)
         {
+ 
             lru_ = new LurchTable<string, CacheItem>(100);
         }
         public void Add(CacheItem i, CacheItemPolicy p)
@@ -85,28 +90,11 @@ namespace WeAmp.EasyCacheDropin
         public NameValueCollection response_headers { get; set; }
     }
 
-
-    public enum ConfigEntryMatchType
-    {
-        Exact,
-        Wildcard
-    }
     public class ConfigEntry
     {
-        public static bool Parse(string s, out ConfigEntry e)
-        {
-            e = new ConfigEntry();
-            e.TTL = 500;
-            e.MatchLine = s;
-            e.MatchType = s.IndexOf("*") >= 0 ? ConfigEntryMatchType.Wildcard : ConfigEntryMatchType.Exact;
-            e.IsNegative = false;
-            return true;
-        }
+
 
         public int TTL;
-        public string MatchLine;
-        public ConfigEntryMatchType MatchType;
-        public bool IsNegative;
 
     }
 
@@ -114,9 +102,8 @@ namespace WeAmp.EasyCacheDropin
     {
         MemoryCache cache_ = null;
         FileSystemWatcher config_watcher_ = null;
-        Dictionary<string, ConfigEntry> ExactConfig = new Dictionary<string, ConfigEntry>();
-        List<ConfigEntry> WildcardConfig = new List<ConfigEntry>();
-        object configLock = new object();
+        public static object configLock = new object();
+        public static System.Type script_ = null;
 
         public void Dispose()
         {
@@ -155,6 +142,7 @@ namespace WeAmp.EasyCacheDropin
         private void App_EndRequest(object sender, EventArgs e)
         {
             Log.WriteLine("App_EndRequest fired");
+
             var f = HttpContext.Current.Response.Filter;
             // TODO: bad assumption. Should store in context somewhere.
             if (f is RecordingFilter)
@@ -166,49 +154,87 @@ namespace WeAmp.EasyCacheDropin
         private void Config_watcher__Changed(object sender, FileSystemEventArgs e)
         {
             Log.WriteLine("Config_watcher__Changed fired");
-            ReloadConfig();
+            if (e.FullPath.IndexOf("easycache.config")>= 0)
+                ReloadConfig();
         }
 
         private void ReloadConfig()
         {
             Log.WriteLine("ReloadConfig()");
 
-            
             string path = Path.Combine(HttpRuntime.AppDomainAppPath, "easycache.config");
             try
             {
-                var lines = File.ReadAllLines(path);
-                lock (configLock)
-                    ExactConfig.Clear();
-                WildcardConfig.Clear();
+                string[] lines = File.ReadAllLines(path);
+                var provider = CSharpCodeProvider.CreateProvider("c#");
+                var options = new CompilerParameters();
+                var ass = new System.Uri(Assembly.GetExecutingAssembly().EscapedCodeBase).LocalPath;
+                options.ReferencedAssemblies.Add("System.Web.dll");
+                options.ReferencedAssemblies.Add(ass);
+                string scripttemplate = @"
+using System.Web;
 
-                foreach (var line in lines)
+public class DynamicRules
+{{
+public static int onrequest() {{
+    HttpRequest request = HttpContext.Current.Request;
+    {0}
+}}
+
+public static bool onresponse() {{
+    HttpRequest request = HttpContext.Current.Request;
+    HttpResponse response = HttpContext.Current.Response;
+    {1}
+}}
+
+}}";
+                string srq = "";
+                string srs = "";
+                bool in_resp = false;
+                foreach (string line in lines)
                 {
-                    string s = line ?? "";
-                    s = s.Trim();
-                    if (s.Length > 1)
+                    string sline = line.Trim();
+                    if (sline == "onrequest():")
                     {
-                        if (s[0] == '#')
-                            continue;
-
+                        continue;
                     }
-                    ConfigEntry e;
-                    if (ConfigEntry.Parse(s, out e))
+                    else if (sline == "onresponse():")
                     {
-                        Log.WriteLine("Parsed config line: {0}", s);
-
-                        if (e.MatchType == ConfigEntryMatchType.Exact)
-                        {
-                            ExactConfig[s] = e;
-                        }
-                        else
-                        {
-                            WildcardConfig.Add(e);
-                        }
+                        in_resp = true;
+                        continue;
+                    }
+                    if (in_resp)
+                    {
+                        srs += line + System.Environment.NewLine;
+                    }
+                    else
+                    {
+                        srq += line + System.Environment.NewLine;
+                    }
+                }
+                string replacedScript = String.Format(scripttemplate, srq, srs);
+                var results = provider.CompileAssemblyFromSource(options, new[] { replacedScript });
+                if (results.Errors.Count > 0)
+                {
+                    script_ = null;
+                    foreach (var error in results.Errors)
+                    {
+                        Log.WriteLine("Error loading script: " + error);
+                    }
+                }
+                else
+                {
+                    System.Type t = results.CompiledAssembly.GetType("DynamicRules");
+                    if (t == null)
+                    {
+                        Log.WriteLine("Could not find target class in script source");
                     }
                     else {
-                        // log
-                        Log.WriteLine("Failed to parse config line: {0}", s);
+                        Log.WriteLine("Script loaded OK!");
+                    }
+                    lock (configLock)
+                    {
+                        script_ = t;
                     }
                 }
             }
@@ -279,107 +305,19 @@ namespace WeAmp.EasyCacheDropin
             }
         }
 
-
-        /// <summary>
-        /// Compares wildcard to string
-        /// </summary>
-        /// <param name="WildString">String to compare</param>
-        /// <param name="Mask">Wildcard mask (ex: *.jpg)</param>
-        /// <returns>True if match found</returns>
-        static bool CompareWildcard(string WildString, string Mask, bool IgnoreCase = true)
-        {
-            int i = 0, k = 0;
-
-            // Cannot continue with Mask empty
-            if (string.IsNullOrEmpty(Mask))
-                return false;
-
-            // If WildString is null -> make it an empty string
-            if (WildString == null)
-                WildString = string.Empty;
-
-            // If Mask is * and WildString isn't empty -> return true
-            if (string.Compare(Mask, "*") == 0 && !string.IsNullOrEmpty(WildString))
-                return true;
-
-            // If Mask is ? and WildString length is 1 -> return true
-            if (string.Compare(Mask, "?") == 0 && WildString.Length == 1)
-                return true;
-
-            // If WildString and Mask match -> no need to go any further
-            if (string.Compare(WildString, Mask, IgnoreCase) == 0)
-                return true;
-
-            while (k != WildString.Length)
-            {
-                switch (Mask[i])
-                {
-                    case '*':
-
-                        if ((i + 1) == Mask.Length)
-                            return true;
-
-                        while (k != WildString.Length)
-                        {
-                            if (CompareWildcard(WildString.Substring(k + 1), Mask.Substring(i + 1), IgnoreCase))
-                                return true;
-
-                            k += 1;
-                        }
-
-                        return false;
-
-                    case '?':
-
-                        break;
-
-                    default:
-
-                        if (IgnoreCase == false && WildString[k] != Mask[i])
-                            return false;
-
-                        if (IgnoreCase && Char.ToLower(WildString[k]) != Char.ToLower(Mask[i]))
-                            return false;
-
-                        break;
-                }
-
-                i += 1;
-                k += 1;
-            }
-
-            if (k == WildString.Length)
-            {
-                if (i == Mask.Length || Mask[i] == '*')
-                    return true;
-            }
-
-            return false;
-        }
         private ConfigEntry GetConfigEntryForQuery(string query)
         {
-            lock (configLock)
-            {
-                ConfigEntry e;
-                if (ExactConfig.TryGetValue(query, out e)) {
-                    if (e.IsNegative)
-                    {
-                        return null;
-                    }
-                    return e;
-                }
-                foreach (var cfg in WildcardConfig)
+            if (script_ == null) return null;
+
+            lock(configLock)
+            { 
+                var r = (int)script_.GetMethod("onrequest").Invoke(null, null);
+                if (r <= 0)
+                    return null;
+                return new ConfigEntry
                 {
-                    if (CompareWildcard(query, cfg.MatchLine, false))
-                    {
-                        if (cfg.IsNegative)
-                        {
-                            return null;
-                        }
-                        return cfg;
-                    }
-                }
-                return null;
+                    TTL = r
+                };
             }
         }
     }
@@ -439,6 +377,8 @@ namespace WeAmp.EasyCacheDropin
                     CacheItem i = new CacheItem(key_);
                     EasyCacheResponseEntry e = new EasyCacheResponseEntry();
                     e.status = 501;
+                    i.Value = e;
+
                     CacheItemPolicy p = new CacheItemPolicy();
                     p.AbsoluteExpiration = DateTime.Now.Add(new TimeSpan(0, 0, 300));
                     cache_.Add(i, p);
@@ -448,6 +388,7 @@ namespace WeAmp.EasyCacheDropin
                 CacheItem i = new CacheItem(key_);
                 EasyCacheResponseEntry e = new EasyCacheResponseEntry();
                 e.status = 502;
+                i.Value = e;
                 CacheItemPolicy p = new CacheItemPolicy();
                 p.AbsoluteExpiration = DateTime.Now.Add(new TimeSpan(0, 0, 300));
                 cache_.Add(i, p);
@@ -506,7 +447,9 @@ namespace WeAmp.EasyCacheDropin
             Log.WriteLine("Close()");
             skip_record_ = true;
             byte[] buf = Encoding.UTF8.GetBytes(buffer_.ToString());
-            _sink.Write(buf, 0, buf.Length);
+            if (buf.Length> 0 ) { 
+                _sink.Write(buf, 0, buf.Length);
+            }
             _sink.Flush();
             _sink.Close();
         }
@@ -531,9 +474,15 @@ namespace WeAmp.EasyCacheDropin
             if (!tested_)
             {
                 tested_ = true;
-                if (ctx.Response.StatusCode == 200 && ctx.Response.ContentType.IndexOf("text/html") >= 0)
+
+                lock (EasyCacheHttpModule.configLock)
                 {
-                    should_record_ = true;
+                    should_record_ = (bool)EasyCacheHttpModule.script_.GetMethod("onresponse").Invoke(null, null)
+                        && ctx.Response.StatusCode == 200;
+                }
+
+                if (should_record_)
+                {
                     foreach (var key in ctx.Response.Headers.AllKeys)
                     {
                         response_headers_[key] = ctx.Response.Headers[key];
