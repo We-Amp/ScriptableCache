@@ -2,7 +2,6 @@
 using System.Collections.Generic;
 using System.Collections.Specialized;
 using System.IO;
-//using System.Runtime.Caching;
 using System.Text;
 using System.Web;
 using CSharpTest.Net.Collections;
@@ -22,7 +21,7 @@ namespace WeAmp.EasyCacheDropin
         {
             string msg = String.Format(fmt, args);
             msg = String.Format("easycache {0}: {1}", (DateTime.Now - start).TotalMilliseconds, msg);
-            Debug.WriteLine(fmt, msg);
+            Debug.WriteLine(msg);
         }
     }
 
@@ -48,7 +47,7 @@ namespace WeAmp.EasyCacheDropin
         public MemoryCache(string name)
         {
  
-            lru_ = new LurchTable<string, CacheItem>(100);
+            lru_ = new LurchTable<string, CacheItem>(100000);
         }
         public void Add(CacheItem i, CacheItemPolicy p)
         {
@@ -86,16 +85,13 @@ namespace WeAmp.EasyCacheDropin
     class EasyCacheResponseEntry
     {
         public int status;
-        public string body { get; set; }
+        public List<byte> body { get; set; }
         public NameValueCollection response_headers { get; set; }
     }
 
     public class ConfigEntry
     {
-
-
         public int TTL;
-
     }
 
     public class EasyCacheHttpModule : IHttpModule
@@ -116,6 +112,7 @@ namespace WeAmp.EasyCacheDropin
             app.Error += App_Error;
             app.PreSendRequestHeaders += App_PreSendRequestHeaders;
 
+
             cache_ = new MemoryCache("EasyCache");
             config_watcher_ = new FileSystemWatcher();
             config_watcher_.BeginInit();
@@ -130,7 +127,7 @@ namespace WeAmp.EasyCacheDropin
         private void App_Error(object sender, EventArgs e)
         {
             var f = HttpContext.Current.Response.Filter;
-            Log.WriteLine("App_Error fired");
+            Log.WriteLine("App_Error fired: " + HttpContext.Current.Server.GetLastError().ToString());
 
             // TODO: bad assumption. Should store in context somewhere.
             if (f is RecordingFilter)
@@ -141,7 +138,7 @@ namespace WeAmp.EasyCacheDropin
 
         private void App_EndRequest(object sender, EventArgs e)
         {
-            Log.WriteLine("App_EndRequest fired");
+            //Log.WriteLine("App_EndRequest fired");
 
             var f = HttpContext.Current.Response.Filter;
             // TODO: bad assumption. Should store in context somewhere.
@@ -266,27 +263,48 @@ public static bool onresponse() {{
             ConfigEntry cfg = GetConfigEntryForQuery(query);
             if (cfg == null)
             {
-                Log.WriteLine("Decline request, no configuration for request found");
+                Log.WriteLine("Decline request, no configuration for request [{0}]", query);
                 return;
             }
 
-            CacheItem i = cache_.GetCacheItem(query);
+            char[] ch = { ',' };
+            List<string> ces = new List<string>();
+            ces.AddRange((HttpContext.Current.Request.Headers["accept-encoding"] ?? "").Split(ch));
+            ces.Add("");
+            CacheItem i = null;
+            Log.WriteLine("Accept-Encodings [{0}] for query [{1}]", (HttpContext.Current.Request.Headers["accept-encoding"] ?? ""), query);
+
+            foreach (string enc in ces)
+            {
+                string senc = enc.Trim();
+                if (string.IsNullOrEmpty(senc))
+                {
+                    senc = "none";
+                }
+                i = cache_.GetCacheItem("enc-" + senc + ":" + query);
+                if (i != null)
+                {
+                    Log.WriteLine("Found cache entry! [{0}]", "enc-" + senc + ":" + query);
+                    break;
+                }
+            }
+
             if (i != null)
             {
                 EasyCacheResponseEntry easy_cache_entry = (EasyCacheResponseEntry)i.Value;
                 if (easy_cache_entry.status == 200) {
-                    Log.WriteLine("Serve cached response");
+                    Log.WriteLine("Serve cached response for [{0}]", query);
                     foreach (var key in easy_cache_entry.response_headers.AllKeys)
                     {
                         ctx.Response.Headers[key] = easy_cache_entry.response_headers[key];
                     }
                     ctx.Response.Headers["X-Cache"] = "HIT";
                     ctx.Response.Headers["X-Age"] = Math.Round((DateTime.Now - i.DateAdded).TotalSeconds).ToString();
-                    ctx.Response.Write(easy_cache_entry.body);
+                    ctx.Response.BinaryWrite(easy_cache_entry.body.ToArray());
                     HttpContext.Current.ApplicationInstance.CompleteRequest();
                 } else
                 {
-                    Log.WriteLine("Rember recently failed or skipped recording");
+                    Log.WriteLine("Rember recently failed or skipped recording for [{0}]", query);
                 }
             }
             else
@@ -295,10 +313,10 @@ public static bool onresponse() {{
                     || ctx.Request.Headers["if-modified-since"] != null
                     || ctx.Request.Headers["if-none-match"] != null)
                 {
-                    Log.WriteLine("Decline request on default request preconditions");
+                    Log.WriteLine("Decline request on default request preconditions for [{0}]", query);
                     return;
                 }
-                Log.WriteLine("Recording response");
+                Log.WriteLine("Recording response for [{0}]", query);
                 var f = new RecordingFilter(ctx.Response.Filter, cache_, query, cfg);
                 ctx.Response.Filter = f;
                 ctx.Response.Headers["X-Cache"] = "MISS";
@@ -325,7 +343,7 @@ public static bool onresponse() {{
     public class RecordingFilter : Stream
     {
         private Stream _sink;
-        StringBuilder buffer_ = new StringBuilder();
+        List<byte> buffer_ = new List<byte>();
         MemoryCache cache_;
         string key_;
         NameValueCollection response_headers_;
@@ -334,6 +352,11 @@ public static bool onresponse() {{
         bool failed_;
         bool skip_record_;
         ConfigEntry config_;
+
+        public void FilterLog(string msg)
+        {
+            Log.WriteLine("{0} [{1}]", msg, key_);
+        }
 
         public RecordingFilter(Stream sink, MemoryCache cache, string key, ConfigEntry cfg)
         {
@@ -357,7 +380,7 @@ public static bool onresponse() {{
                     CacheItem i = new CacheItem(key_);
                     EasyCacheResponseEntry e = new EasyCacheResponseEntry();
                     e.status = 200;
-                    e.body = buffer_.ToString();
+                    e.body = buffer_;
                     e.response_headers = response_headers_;
                     response_headers_.Remove("last-modified");
                     response_headers_.Remove("etag");
@@ -368,11 +391,13 @@ public static bool onresponse() {{
                     i.Value = e;
                     CacheItemPolicy p = new CacheItemPolicy();
                     p.AbsoluteExpiration = DateTime.Now.Add(new TimeSpan(0, 0, config_.TTL));
+
+                    FilterLog(string.Format("Add to cache, TTL: {0}, valid through: {1}", config_.TTL, p.AbsoluteExpiration.ToString()));
                     cache_.Add(i, p);
                     buffer_ = null;
                 } else
                 {
-                    Log.WriteLine("Mark recording as failed in cache because failed_ is set");
+                    FilterLog("Mark recording as failed in cache because failed_ is set");
 
                     CacheItem i = new CacheItem(key_);
                     EasyCacheResponseEntry e = new EasyCacheResponseEntry();
@@ -383,8 +408,8 @@ public static bool onresponse() {{
                     p.AbsoluteExpiration = DateTime.Now.Add(new TimeSpan(0, 0, 300));
                     cache_.Add(i, p);
                 }
-            } else {
-                Log.WriteLine("Mark recording as failed in cache because should_record_ is not set based on response headers");
+            } else if (tested_) {
+                FilterLog("Mark recording as failed in cache because should_record_ is not set based on response headers");
                 CacheItem i = new CacheItem(key_);
                 EasyCacheResponseEntry e = new EasyCacheResponseEntry();
                 e.status = 502;
@@ -392,12 +417,15 @@ public static bool onresponse() {{
                 CacheItemPolicy p = new CacheItemPolicy();
                 p.AbsoluteExpiration = DateTime.Now.Add(new TimeSpan(0, 0, 300));
                 cache_.Add(i, p);
+            } else
+            {
+                FilterLog("Skip recording that was aborted early / not started");
             }
         }
 
         public void Fail()
         {
-            Log.WriteLine("Fail() called");
+            FilterLog("Fail() called");
             failed_ = true;
         }
 
@@ -432,23 +460,22 @@ public static bool onresponse() {{
 
         public override long Seek(long offset, System.IO.SeekOrigin direction)
         {
-            Log.WriteLine("Seek()");
+            FilterLog("Seek()");
             return _sink.Seek(offset, direction);
         }
 
         public override void SetLength(long length)
         {
-            Log.WriteLine("SetLength()");
+            FilterLog("SetLength()");
             _sink.SetLength(length);
         }
 
         public override void Close()
         {
-            Log.WriteLine("Close()");
+            FilterLog("Close()");
             skip_record_ = true;
-            byte[] buf = Encoding.UTF8.GetBytes(buffer_.ToString());
-            if (buf.Length> 0 ) { 
-                _sink.Write(buf, 0, buf.Length);
+            if (buffer_.Count> 0 ) { 
+                _sink.Write(buffer_.ToArray(), 0, buffer_.Count);
             }
             _sink.Flush();
             _sink.Close();
@@ -456,13 +483,13 @@ public static bool onresponse() {{
 
         public override void Flush()
         {
-            Log.WriteLine("Flush()");
+            FilterLog("Flush()");
             //_sink.Flush();
         }
 
         public override int Read(byte[] buffer, int offset, int count)
         {
-            Log.WriteLine("Read()");
+            FilterLog("Read()");
             return _sink.Read(buffer, offset, count);
         }
 
@@ -477,7 +504,9 @@ public static bool onresponse() {{
 
                 lock (EasyCacheHttpModule.configLock)
                 {
-                    should_record_ = (bool)EasyCacheHttpModule.script_.GetMethod("onresponse").Invoke(null, null)
+                    bool script_cacheable = (bool)EasyCacheHttpModule.script_.GetMethod("onresponse").Invoke(null, null);
+                    FilterLog(string.Format("Scripted cachability: {0}, Response status: {1}", script_cacheable.ToString(), ctx.Response.StatusCode.ToString()));
+                    should_record_ = script_cacheable 
                         && ctx.Response.StatusCode == 200;
                 }
 
@@ -487,14 +516,21 @@ public static bool onresponse() {{
                     {
                         response_headers_[key] = ctx.Response.Headers[key];
                     }
+                    string ce = response_headers_["content-encoding"] ?? "";
+                    if (string.IsNullOrEmpty(ce))
+                        ce = "none";
+                    key_ = "enc-" + ce + ":" + key_;
+
                 }
             }
             if (should_record_ && !skip_record_)
             {
                 string s = Encoding.UTF8.GetString(buffer, offset, count);
-                Log.WriteLine("Write: " + offset.ToString() + " (" + count.ToString() + ") " + buffer.GetHashCode().ToString());
-
-                buffer_.Append(s);
+                FilterLog("Write: " + offset.ToString() + " (" + count.ToString() + ") " + buffer.GetHashCode().ToString());
+                int written = 0;
+                for (int i = offset; written < count; i++, written++) {
+                    buffer_.Add(buffer[i]);
+                }
             }
             //_sink.Write(buffer, offset, count);
         }
