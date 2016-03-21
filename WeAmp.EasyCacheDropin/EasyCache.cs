@@ -43,20 +43,19 @@ namespace WeAmp.EasyCacheDropin
 
     public class MemoryCache
     {
-        CSharpTest.Net.Collections.LurchTable<string, CacheItem> lru_;
+        static CSharpTest.Net.Collections.LurchTable<string, CacheItem> lru_;
         public MemoryCache(string name)
         {
  
-            lru_ = new LurchTable<string, CacheItem>(100000);
+            lru_ = new LurchTable<string, CacheItem>(LurchTableOrder.Access, 100000);
         }
         public void Add(CacheItem i, CacheItemPolicy p)
         {
             i.ValidUntil = p.AbsoluteExpiration;
             i.DateAdded = DateTime.Now;
-            if (lru_.TryAdd(i.Key, i))
-            {
-                // log success & fail
-            }
+            bool success = lru_.TryAdd(i.Key, i);
+            
+            Log.WriteLine("Add [{0}] => {1} (cache has {2} items): ", i.Key, success.ToString(), lru_.Count.ToString());
         }
         public CacheItem GetCacheItem(string key)
         {
@@ -65,6 +64,7 @@ namespace WeAmp.EasyCacheDropin
             {
                 if (DateTime.Now >= v.ValidUntil)
                 {
+                    Log.WriteLine("Found [{0}] but {1} >= {2}", key, DateTime.Now.ToString(), v.ValidUntil.ToString());
                     if (lru_.TryRemove(key, out v))
                     {
                         // log evicition / fail
@@ -72,6 +72,9 @@ namespace WeAmp.EasyCacheDropin
                     return null;
                 }
                 return v;
+            } else
+            {
+                Log.WriteLine("Cache entry not found [{0}] ", key);
             }
             return null;
         }
@@ -96,8 +99,8 @@ namespace WeAmp.EasyCacheDropin
 
     public class EasyCacheHttpModule : IHttpModule
     {
-        MemoryCache cache_ = null;
-        FileSystemWatcher config_watcher_ = null;
+        static MemoryCache cache_ = null;
+        static FileSystemWatcher config_watcher_ = null;
         public static object configLock = new object();
         public static System.Type script_ = null;
 
@@ -107,21 +110,28 @@ namespace WeAmp.EasyCacheDropin
         }
         public void Init(HttpApplication app)
         {
+            Log.WriteLine("Application init fired! ");
             app.BeginRequest += App_BeginRequest;
             app.EndRequest += App_EndRequest;
             app.Error += App_Error;
-            app.PreSendRequestHeaders += App_PreSendRequestHeaders;
 
-
-            cache_ = new MemoryCache("EasyCache");
-            config_watcher_ = new FileSystemWatcher();
-            config_watcher_.BeginInit();
-            config_watcher_.Path = HttpRuntime.AppDomainAppPath;
-            config_watcher_.IncludeSubdirectories = false;
-            config_watcher_.Changed += Config_watcher__Changed;
-            config_watcher_.EnableRaisingEvents = true;
-            config_watcher_.EndInit();
-            ReloadConfig();
+            lock (configLock) {
+                if (cache_ != null)
+                {
+                    Log.WriteLine("Already initialized here, bail");
+                    return;
+                }
+                cache_ = new MemoryCache("EasyCache");
+                config_watcher_ = new FileSystemWatcher();
+                config_watcher_.BeginInit();
+                config_watcher_.Path = HttpRuntime.AppDomainAppPath;
+                config_watcher_.IncludeSubdirectories = false;
+                config_watcher_.Filter = "*.config";
+                config_watcher_.Changed += Config_watcher__Changed;
+                config_watcher_.EnableRaisingEvents = true;
+                config_watcher_.EndInit();
+                ReloadConfig();
+            }
         }
 
         private void App_Error(object sender, EventArgs e)
@@ -151,7 +161,7 @@ namespace WeAmp.EasyCacheDropin
         private void Config_watcher__Changed(object sender, FileSystemEventArgs e)
         {
             Log.WriteLine("Config_watcher__Changed fired");
-            if (e.FullPath.IndexOf("easycache.config")>= 0)
+            if (e.FullPath.IndexOf("easycache.config") >= 0)
                 ReloadConfig();
         }
 
@@ -165,10 +175,15 @@ namespace WeAmp.EasyCacheDropin
                 string[] lines = File.ReadAllLines(path);
                 var provider = CSharpCodeProvider.CreateProvider("c#");
                 var options = new CompilerParameters();
+                options.IncludeDebugInformation = true;
                 var ass = new System.Uri(Assembly.GetExecutingAssembly().EscapedCodeBase).LocalPath;
                 options.ReferencedAssemblies.Add("System.Web.dll");
+                options.ReferencedAssemblies.Add("System.dll");
                 options.ReferencedAssemblies.Add(ass);
+                // TODO: just make a .cs file.
                 string scripttemplate = @"
+using System;
+using System.Diagnostics;
 using System.Web;
 
 public class DynamicRules
@@ -239,11 +254,6 @@ public static bool onresponse() {{
             {
                 Log.WriteLine("Exception reloading config: {0}", ex.Message);
             }
-        }
-
-        private void App_PreSendRequestHeaders(object sender, EventArgs e)
-        {
-
         }
 
         private void App_BeginRequest(object sender, EventArgs e)
@@ -325,11 +335,24 @@ public static bool onresponse() {{
 
         private ConfigEntry GetConfigEntryForQuery(string query)
         {
-            if (script_ == null) return null;
-
+            if (script_ == null)
+            {
+                Debug.WriteLine("script_ == null, return null");
+                return null;
+            }
             lock(configLock)
-            { 
-                var r = (int)script_.GetMethod("onrequest").Invoke(null, null);
+            {
+                int r=-99999999;
+                try { 
+                    r = (int)script_.GetMethod("onrequest").Invoke(null, null);
+                    Debug.WriteLine("onrequest TTL: " + r.ToString());
+                }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine("onrequest excepted: " + ex.ToString());
+
+                }
+
                 if (r <= 0)
                     return null;
                 return new ConfigEntry
@@ -373,6 +396,11 @@ public static bool onresponse() {{
 
         public void Done()
         {
+            string ce = response_headers_["content-encoding"] ?? "";
+            if (string.IsNullOrEmpty(ce))
+                ce = "none";
+            key_ = "enc-" + ce + ":" + key_;
+
             if (should_record_)
             {
                 if (!failed_)
@@ -397,16 +425,18 @@ public static bool onresponse() {{
                     buffer_ = null;
                 } else
                 {
-                    FilterLog("Mark recording as failed in cache because failed_ is set");
+                    if (tested_) { 
+                        FilterLog("Mark recording as failed in cache because failed_ is set");
 
-                    CacheItem i = new CacheItem(key_);
-                    EasyCacheResponseEntry e = new EasyCacheResponseEntry();
-                    e.status = 501;
-                    i.Value = e;
+                        CacheItem i = new CacheItem(key_);
+                        EasyCacheResponseEntry e = new EasyCacheResponseEntry();
+                        e.status = 501;
+                        i.Value = e;
 
-                    CacheItemPolicy p = new CacheItemPolicy();
-                    p.AbsoluteExpiration = DateTime.Now.Add(new TimeSpan(0, 0, 300));
-                    cache_.Add(i, p);
+                        CacheItemPolicy p = new CacheItemPolicy();
+                        p.AbsoluteExpiration = DateTime.Now.Add(new TimeSpan(0, 0, 300));
+                        cache_.Add(i, p);
+                    }
                 }
             } else if (tested_) {
                 FilterLog("Mark recording as failed in cache because should_record_ is not set based on response headers");
@@ -504,6 +534,7 @@ public static bool onresponse() {{
 
                 lock (EasyCacheHttpModule.configLock)
                 {
+                    // todo:catch errors
                     bool script_cacheable = (bool)EasyCacheHttpModule.script_.GetMethod("onresponse").Invoke(null, null);
                     FilterLog(string.Format("Scripted cachability: {0}, Response status: {1}", script_cacheable.ToString(), ctx.Response.StatusCode.ToString()));
                     should_record_ = script_cacheable 
@@ -516,23 +547,20 @@ public static bool onresponse() {{
                     {
                         response_headers_[key] = ctx.Response.Headers[key];
                     }
-                    string ce = response_headers_["content-encoding"] ?? "";
-                    if (string.IsNullOrEmpty(ce))
-                        ce = "none";
-                    key_ = "enc-" + ce + ":" + key_;
-
                 }
             }
             if (should_record_ && !skip_record_)
             {
-                string s = Encoding.UTF8.GetString(buffer, offset, count);
+                //string s = Encoding.UTF8.GetString(buffer, offset, count);
                 FilterLog("Write: " + offset.ToString() + " (" + count.ToString() + ") " + buffer.GetHashCode().ToString());
                 int written = 0;
                 for (int i = offset; written < count; i++, written++) {
                     buffer_.Add(buffer[i]);
                 }
             }
-            //_sink.Write(buffer, offset, count);
+            if (!should_record_) {
+                _sink.Write(buffer, offset, count);
+            }
         }
     }
 }
