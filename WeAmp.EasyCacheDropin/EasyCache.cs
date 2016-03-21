@@ -44,6 +44,9 @@ namespace WeAmp.EasyCacheDropin
     public class MemoryCache
     {
         static CSharpTest.Net.Collections.LurchTable<string, CacheItem> lru_;
+
+
+
         public MemoryCache(string name)
         {
  

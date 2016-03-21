@@ -49,6 +49,12 @@
     <None Include="app.config" />
     <None Include="packages.config" />
   </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="C:\Users\oscha\OneDrive\Documenten\Visual Studio 2015\Projects\WeAmp.EasyCacheDropin\beitmemcached\BeITMemcached.csproj">
+      <Project>{b09b6f90-7af4-43be-8c02-e36ab2487a98}</Project>
+      <Name>BeITMemcached</Name>
+    </ProjectReference>
+  </ItemGroup>
   <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets" />
   <!-- To modify your build process, add your task inside one of the targets below and uncomment it. 
        Other similar extension points exist, see Microsoft.Common.targets.
