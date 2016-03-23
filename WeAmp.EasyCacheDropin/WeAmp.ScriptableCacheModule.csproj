@@ -7,8 +7,8 @@
     <ProjectGuid>{862AEF30-AAB1-4524-B963-F9BE4B8CBE1C}</ProjectGuid>
     <OutputType>Library</OutputType>
     <AppDesignerFolder>Properties</AppDesignerFolder>
-    <RootNamespace>WeAmp.EasyCacheDropin</RootNamespace>
-    <AssemblyName>WeAmp.EasyCacheDropin</AssemblyName>
+    <RootNamespace>WeAmp.ScriptableCacheModule</RootNamespace>
+    <AssemblyName>WeAmp.ScriptableCacheModule</AssemblyName>
     <TargetFrameworkVersion>v2.0</TargetFrameworkVersion>
     <FileAlignment>512</FileAlignment>
     <TargetFrameworkProfile />

@@ -3,7 +3,7 @@ Microsoft Visual Studio Solution File, Format Version 12.00
 # Visual Studio 14
 VisualStudioVersion = 14.0.24720.0
 MinimumVisualStudioVersion = 10.0.40219.1
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "WeAmp.EasyCacheDropin", "WeAmp.EasyCacheDropin\WeAmp.EasyCacheDropin.csproj", "{862AEF30-AAB1-4524-B963-F9BE4B8CBE1C}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "WeAmp.ScriptableCacheModule", "WeAmp.EasyCacheDropin\WeAmp.ScriptableCacheModule.csproj", "{862AEF30-AAB1-4524-B963-F9BE4B8CBE1C}"
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "WebApplication1", "WebApplication1\WebApplication1.csproj", "{EE6F2CCC-D1B9-47D6-A232-1169F3E38A47}"
 EndProject

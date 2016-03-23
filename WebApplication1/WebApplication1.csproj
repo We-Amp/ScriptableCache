@@ -65,9 +65,7 @@
     </Compile>
   </ItemGroup>
   <ItemGroup>
-    <Content Include="easycache.config">
-      <SubType>Designer</SubType>
-    </Content>
+    <Compile Include="WeAmp.ScriptableCache.cs" />
     <None Include="Web.Debug.config">
       <DependentUpon>Web.config</DependentUpon>
     </None>
@@ -76,9 +74,9 @@
     </None>
   </ItemGroup>
   <ItemGroup>
-    <ProjectReference Include="..\WeAmp.EasyCacheDropin\WeAmp.EasyCacheDropin.csproj">
+    <ProjectReference Include="..\WeAmp.EasyCacheDropin\WeAmp.ScriptableCacheModule.csproj">
       <Project>{862aef30-aab1-4524-b963-f9be4b8cbe1c}</Project>
-      <Name>WeAmp.EasyCacheDropin</Name>
+      <Name>WeAmp.ScriptableCacheModule</Name>
     </ProjectReference>
   </ItemGroup>
   <PropertyGroup>
