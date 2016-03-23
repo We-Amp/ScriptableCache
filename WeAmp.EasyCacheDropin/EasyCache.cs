@@ -282,7 +282,7 @@ namespace WeAmp.ScriptableCacheModule
                     @"
 <html>
 <body>
-<h1>Weamp.ScriptableCache Statistics</1>
+<h1>Weamp.ScriptableCache Statistics</h1>
 <pre>
 {0}
 </pre>
