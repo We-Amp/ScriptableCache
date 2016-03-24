@@ -16,12 +16,23 @@ namespace WeAmp.ScriptableCacheModule
     public static class Log
     {
         static DateTime start = DateTime.Now;
-
+        static CircularBuffer<string> Buffer = new CircularBuffer<string>(1000);
         public static void WriteLine(string fmt, params string[] args)
         {
             string msg = String.Format(fmt, args);
-            msg = String.Format("[WeAmp.ScriptableCache] {0}", msg);
+            msg = String.Format("[WeAmp.ScriptableCache][{0}] {1}", DateTime.Now.ToLongTimeString(), msg);
+            Buffer.Put(msg);
             Trace.WriteLine(msg);
+        }
+        public static string GetLog()
+        {
+            StringBuilder sb = new StringBuilder();
+            string[] lines = Buffer.ToArray();
+            for (int i = lines.Length - 1; i >= 0; --i)
+            {
+                sb.AppendLine(lines[i]);
+            }
+            return sb.ToString();
         }
     }
 
@@ -266,20 +277,10 @@ namespace WeAmp.ScriptableCacheModule
             var query = ctx.Request.Url.ToString();
             HttpContext.Current.Items.Add("WeAmp.ScriptCache.RequestStart", DateTime.Now);
 
-            // TODO(oschaaf): fix / should be configurable.
-            if (query.Contains("/WeAmp.ScriptCache.Purge"))
-            {
-                Log.WriteLine("Executing purge");
-                cache_.PurgeAll();
-                ctx.Response.Write("Cache purged OK");
-                ++Statistics.PurgesProcessed;
-                HttpContext.Current.ApplicationInstance.CompleteRequest();
-            } else 
-            if (query.EndsWith("/Weamp.ScriptCache.Stats"))
-            {
-                string template=  
-                
-                    @"
+
+            string template =
+
+                @"
 <html>
 <body>
 <h1>Weamp.ScriptableCache Statistics</h1>
@@ -292,6 +293,28 @@ setTimeout('document.reload()', 5);
 </body>
 </html>
 ";
+
+            // TODO(oschaaf): fix / should be configurable.
+            if (query.Contains("/WeAmp.ScriptCache.Logs"))
+            {
+                HttpContext.Current.Response.ContentType = "text/html";
+                HttpContext.Current.Response.Write(string.Format(template, Log.GetLog()));
+                HttpContext.Current.ApplicationInstance.CompleteRequest();
+                return;
+            } else if (query.Contains("/WeAmp.ScriptCache.Purge"))
+            {
+                Log.WriteLine("Executing purge");
+                cache_.PurgeAll();
+
+                HttpContext.Current.Response.ContentType = "text/html";
+                HttpContext.Current.Response.Write(string.Format(template, "Cache purged OK"));
+                ++Statistics.PurgesProcessed;
+                HttpContext.Current.ApplicationInstance.CompleteRequest();
+                return;
+            } else 
+            if (query.EndsWith("/Weamp.ScriptCache.Stats"))
+            {
+
                 string s = "";
                 s += "Total Requests seen: " + Statistics.TotalRequests + "\n";
                 s += "Cache Hits: " + Statistics.Hits + "\n";
