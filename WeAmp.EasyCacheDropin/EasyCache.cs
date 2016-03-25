@@ -9,25 +9,119 @@ using System.Diagnostics;
 using Microsoft.CSharp;
 using System.CodeDom.Compiler;
 using System.Reflection;
-
+using WeAmp.ScriptableCacheModule.CircularBuffer;
+using BeIT.MemCached;
+using System.Runtime.Serialization;
+using System.Collections;
+using System.Threading;
 
 namespace WeAmp.ScriptableCacheModule
 {
+
+    public static class FetchQueue
+    {
+        static object lock_ = new object();
+        static object waitlock_ = new object();
+        static Dictionary<string, bool> map_ = new Dictionary<string, bool>();
+        static Queue<string> queue_ = new Queue<string>();
+
+        static FetchQueue()
+        {
+            ThreadStart ts = new ThreadStart(ProcessQueue);
+            Thread t = new Thread(ts);
+            t.Start();
+        }
+
+        public static bool Add(string url)
+        {
+            Log.WriteLine("Adding " + url + " to background fetch");
+            bool res;
+            lock (lock_)
+            {
+                if (!map_.ContainsKey(url))
+                {
+                    map_.Add(url, true);
+                    queue_.Enqueue(url);
+                    res = true;
+                }
+                else
+                {
+                    res = false;
+                }
+            }
+            if (res)
+            {
+                lock(waitlock_)
+                    Monitor.Pulse(waitlock_);
+            }
+            return res;
+        }
+
+        private static void ProcessQueue()
+        {
+            bool more = false;
+            while (true)
+            {
+                if (!more)
+                {
+                    lock(waitlock_)
+                        Monitor.Wait(waitlock_, 500);
+                }
+                string url = "";
+                lock (lock_)
+                {
+                    if (queue_.Count > 0)
+                    {
+                        url = queue_.Dequeue();
+                    }
+                }
+                if (url != "")
+                {
+                    ProccessUrl(url);
+                    lock (lock_)
+                    {
+                        map_.Remove(url);
+                        more = queue_.Count > 0;
+                    }
+                }
+                else
+                {
+                    more = false;
+                }
+            }
+        }
+
+        private static void ProccessUrl(string key)
+        {
+            var webClient = new System.Net.WebClient();
+            string enc = key.Substring(0, key.IndexOf(':'));
+            string url = key.Substring(key.IndexOf(':') + 1);
+            Log.WriteLine("Background fetch starting for: " + key);
+            webClient.Headers["Accept-Encoding"] = enc;
+            webClient.Headers["BGFETCH"] = "1";
+            string data = webClient.DownloadString(url);
+            Log.WriteLine("Background fetch finished for: " + key);
+        }
+    }
     public static class Log
     {
         static DateTime start = DateTime.Now;
-        static CircularBuffer<string> Buffer = new CircularBuffer<string>(1000);
+        static CircularBuffer<string> Buffer = new CircularBuffer<string>(10);
+        static object bufferLock_ = new { };
         public static void WriteLine(string fmt, params string[] args)
         {
             string msg = String.Format(fmt, args);
             msg = String.Format("[WeAmp.ScriptableCache][{0}] {1}", DateTime.Now.ToLongTimeString(), msg);
-            Buffer.Put(msg);
-            Trace.WriteLine(msg);
+            lock (bufferLock_)
+                Buffer.Add(msg);
+            Debug.WriteLine(msg);
         }
         public static string GetLog()
         {
             StringBuilder sb = new StringBuilder();
-            string[] lines = Buffer.ToArray();
+            string[] lines;
+            lock (bufferLock_)
+                lines = Buffer.ToArray();
             for (int i = lines.Length - 1; i >= 0; --i)
             {
                 sb.AppendLine(lines[i]);
@@ -40,62 +134,134 @@ namespace WeAmp.ScriptableCacheModule
     {
         public DateTime AbsoluteExpiration { get; set; }
     }
+
+    [Serializable()]
     public class CacheItem
     {
         public CacheItem(string key)
         {
             this.Key = key;
         }
-        public object Value;
         public string Key;
         public DateTime DateAdded;
         public DateTime ValidUntil;
+
+
+        public int Status;
+        public List<byte> Body { get; set; }
+        public NameValueCollection ResponseHeaders { get; set; }
     }
 
     public class MemoryCache
     {
+        static MemcachedClient memc_;
         static CSharpTest.Net.Collections.LurchTable<string, CacheItem> lru_;
+
+        public MemoryCache(string name, Hashtable cfg)
+        {
+            int lruMaxItems = 10000;
+            string[] memcachedServers = null;
+            if (cfg != null)
+            {
+                if (cfg["LruMaxItems"] != null)
+                    lruMaxItems = (int)cfg["LruMaxItems"];
+                if (cfg["MemcachedServers"] != null)
+                    memcachedServers = (string[])cfg["MemcachedServers"];
+            }
+
+            Log.WriteLine("Configured LruMaxItems: {0}", lruMaxItems.ToString());
+            lru_ = new LurchTable<string, CacheItem>(LurchTableOrder.Access, lruMaxItems);
+
+            if (memcachedServers != null && memcachedServers.Length > 0)
+            {
+                Log.WriteLine("Configured MemcachedServers: {0}", string.Join(",", memcachedServers));
+                MemcachedClient.Setup("WeAmp.ScriptableCache", memcachedServers);
+                memc_ = MemcachedClient.GetInstance("WeAmp.ScriptableCache");
+            }
+            lru_.ItemRemoved += Lru__ItemRemoved;
+        }
+
 
         public static int GetApproxItemCount()
         {
-            lru_.ItemRemoved += Lru__ItemRemoved;
             return lru_.Count;
         }
 
         private static void Lru__ItemRemoved(KeyValuePair<string, CacheItem> obj)
         {
             ++Statistics.CacheItemsEvicted;
-            Log.WriteLine("Cache entry evicted: " + obj.Value.Key + "(" + ((ScriptableCacheResponseEntry)obj.Value.Value).status.ToString() + ")");
+            Log.WriteLine("Cache entry evicted: " + obj.Key + "(" + obj.Value.Status.ToString() + ")");
         }
 
-        public MemoryCache(string name)
-        {
- 
-            lru_ = new LurchTable<string, CacheItem>(LurchTableOrder.Access, 10000);
-        }
         public void Add(CacheItem i, CacheItemPolicy p)
         {
             i.ValidUntil = p.AbsoluteExpiration;
             i.DateAdded = DateTime.Now;
-            bool success = lru_.TryAdd(i.Key, i);
-            
-            Log.WriteLine("Add [{0}] => {1} (cache has {2} items): ", i.Key, success.ToString(), lru_.Count.ToString());
+            KeyValueUpdate<string, CacheItem> kvu = new KeyValueUpdate<string, CacheItem>(
+                (key,val) =>
+                {
+                    Log.WriteLine("Add/upd key " + key + ":" + val.ValidUntil.ToString());
+                    return val;
+                });
+            lru_.AddOrUpdate(i.Key, i, kvu);
+            if (memc_ != null)
+            {
+                bool memc_set_result = memc_.Set(i.Key, i, i.ValidUntil - DateTime.Now);
+                Log.WriteLine("Add [{0}] for {3} => MemC:{1} (cache has {2} items)", i.Key, memc_set_result.ToString(), lru_.Count.ToString(), (i.ValidUntil - DateTime.Now).ToString());
+            }
         }
         public CacheItem GetCacheItem(string key)
         {
             CacheItem v;
             if (lru_.TryGetValue(key, out v))
             {
-                if (DateTime.Now >= v.ValidUntil)
+                if (v.Status == 404)
                 {
-                    Log.WriteLine("Found [{0}] but {1} >= {2}", key, DateTime.Now.ToString(), v.ValidUntil.ToString());
-                    if (lru_.TryRemove(key, out v))
+                    if (DateTime.Now >= v.ValidUntil)
+                    {
+                        lru_.TryRemove(key, out v);
+                    }
+
+                    Log.WriteLine("LRU found [{0}] 404 for backend", key);
+                    return null;
+                } else if (DateTime.Now >= v.ValidUntil)
+                {
+                    Log.WriteLine("LRU found [{0}] but {1} >= {2}", key, DateTime.Now.ToString(), v.ValidUntil.ToString());
+
+                    if (!lru_.TryRemove(key, out v))
                     {
                         Log.WriteLine("Eviction failed for [{0}] but {1} >= {2}", key, DateTime.Now.ToString(), v.ValidUntil.ToString());
                     }
                     return null;
                 }
+                else if (v.Status == 200 && (v.ValidUntil - DateTime.Now).Seconds <= 30)
+                {
+                    FetchQueue.Add(v.Key);
+                    return v;
+                } else
+
+                Log.WriteLine("LRU found [{0}] 200/OK", key);
                 return v;
+            }
+            else if (memc_ != null)
+            {
+                v = (CacheItem)memc_.Get(key);
+                if (v != null)
+                {
+                    bool addres = lru_.TryAdd(key, v);
+                    Log.WriteLine("Memcached found [{0}] - prop. to LRU: {1}", key, addres.ToString());
+                    return v;
+                }
+                else
+                {/*
+                    v = new CacheItem(key);
+                    CacheItemPolicy p = new CacheItemPolicy();
+                    p.AbsoluteExpiration = DateTime.Now.Add(new TimeSpan(0, 5, 0)); 
+                    v.Status = 404;
+                    bool lrustatus = lru_.TryAdd(v.Key, v);
+                    Log.WriteLine("Memcached entry not found [{0}] (marked as 404 in LRU -> )", key, lrustatus.ToString());
+                    return null;*/
+                }
             }
             return null;
         }
@@ -103,14 +269,8 @@ namespace WeAmp.ScriptableCacheModule
         public void PurgeAll()
         {
             lru_.Clear();
+            memc_.FlushAll();
         }
-    }
-
-    class ScriptableCacheResponseEntry
-    {
-        public int status;
-        public List<byte> body { get; set; }
-        public NameValueCollection response_headers { get; set; }
     }
 
     public class ConfigEntry
@@ -156,13 +316,13 @@ namespace WeAmp.ScriptableCacheModule
             app.EndRequest += App_EndRequest;
             app.Error += App_Error;
 
-            lock (configLock) {
+            lock (configLock)
+            {
                 if (cache_ != null)
                 {
                     Log.WriteLine("Already initialized here, bail");
                     return;
                 }
-                cache_ = new MemoryCache("ScriptableCache");
                 config_watcher_ = new FileSystemWatcher();
                 config_watcher_.BeginInit();
                 config_watcher_.Path = HttpRuntime.AppDomainAppPath;
@@ -172,6 +332,16 @@ namespace WeAmp.ScriptableCacheModule
                 config_watcher_.EnableRaisingEvents = true;
                 config_watcher_.EndInit();
                 ReloadConfig();
+                try
+                {
+                    var cfg = (Hashtable)script_.GetMethod("GetConfiguration").Invoke(null, null);
+                    cache_ = new MemoryCache("ScriptableCache", cfg);
+                }
+                catch (Exception ex)
+                {
+                    Log.WriteLine("Exception calling script.GetConfiguration() - use defaults: " + ex.ToString());
+                    cache_ = new MemoryCache("ScriptableCache", null);
+                }
             }
         }
 
@@ -188,7 +358,7 @@ namespace WeAmp.ScriptableCacheModule
 
         private void App_EndRequest(object sender, EventArgs e)
         {
-    //        ++Statistics.AppErrorsFired;
+            //        ++Statistics.AppErrorsFired;
 
             var f = (Stream)HttpContext.Current.Items["WeAmp.ScriptCache.Filter"];
             if (f != null)
@@ -201,12 +371,13 @@ namespace WeAmp.ScriptableCacheModule
 
         private void Config_watcher__Changed(object sender, FileSystemEventArgs e)
         {
-            if (e.FullPath.IndexOf("WeAmp.ScriptableCache.cs") >= 0) {
+            if (e.FullPath.IndexOf("WeAmp.ScriptableCache.cs") >= 0)
+            {
                 ++Statistics.ConfigReloads;
                 Log.WriteLine("Config_watcher__Changed fired {0} / {1}", e.FullPath, e.ChangeType.ToString());
                 System.Threading.ThreadStart ts = new System.Threading.ThreadStart(DelayedReloadConfig);
                 System.Threading.Thread t = new System.Threading.Thread(ts);
-                t.IsBackground=true;
+                t.IsBackground = true;
                 t.Start();
             }
         }
@@ -258,7 +429,7 @@ namespace WeAmp.ScriptableCacheModule
                     }
                 }
             }
-            catch(Exception ex)
+            catch (Exception ex)
             {
                 Log.WriteLine("Exception reloading config: {0}", ex.Message);
                 lock (configLock)
@@ -276,7 +447,6 @@ namespace WeAmp.ScriptableCacheModule
             var ctx = app.Context;
             var query = ctx.Request.Url.ToString();
             HttpContext.Current.Items.Add("WeAmp.ScriptCache.RequestStart", DateTime.Now);
-
 
             string template =
 
@@ -301,7 +471,8 @@ setTimeout('document.reload()', 5);
                 HttpContext.Current.Response.Write(string.Format(template, Log.GetLog()));
                 HttpContext.Current.ApplicationInstance.CompleteRequest();
                 return;
-            } else if (query.Contains("/WeAmp.ScriptCache.Purge"))
+            }
+            else if (query.Contains("/WeAmp.ScriptCache.Purge"))
             {
                 Log.WriteLine("Executing purge");
                 cache_.PurgeAll();
@@ -311,8 +482,9 @@ setTimeout('document.reload()', 5);
                 ++Statistics.PurgesProcessed;
                 HttpContext.Current.ApplicationInstance.CompleteRequest();
                 return;
-            } else 
-            if (query.EndsWith("/Weamp.ScriptCache.Stats"))
+            }
+            else
+          if (query.EndsWith("/Weamp.ScriptCache.Stats"))
             {
 
                 string s = "";
@@ -336,7 +508,7 @@ setTimeout('document.reload()', 5);
                 HttpContext.Current.Response.Write(string.Format(template, s));
                 HttpContext.Current.ApplicationInstance.CompleteRequest();
                 return;
-           }
+            }
 
 
             char[] ch = { ',' };
@@ -346,38 +518,50 @@ setTimeout('document.reload()', 5);
             CacheItem i = null;
             Log.WriteLine("Accept-Encodings [{0}] for query [{1}]", (HttpContext.Current.Request.Headers["accept-encoding"] ?? ""), query);
 
-            foreach (string enc in ces)
+            bool is_background = ctx.Request.Headers["BGFETCH"] == "1";
+            if (is_background)
+            {
+                Log.WriteLine("Processing background fetch");
+            }
+
+            if (!is_background)
+            foreach (string enc in new string[] { "br", "gzip", "" })
             {
                 string senc = enc.Trim();
                 if (string.IsNullOrEmpty(senc))
                 {
                     senc = "none";
                 }
+                else
+                {
+                    if (!ces.Contains(senc)) continue;
+                }
                 i = cache_.GetCacheItem("enc-" + senc + ":" + query);
                 if (i != null)
                 {
-                    Log.WriteLine("Found cache entry! [{0}]", "enc-" + senc + ":" + query);
+                    Log.WriteLine("Found cache entry! [{0}] ({1})", "enc-" + senc + ":" + query, i.Status.ToString());
                     break;
                 }
             }
 
             if (i != null)
             {
-                ScriptableCacheResponseEntry cache_entry = (ScriptableCacheResponseEntry)i.Value;
-                if (cache_entry.status == 200) {
+                if (i.Status == 200)
+                {
                     ++Statistics.Hits;
-                    foreach (var key in cache_entry.response_headers.AllKeys)
+                    foreach (var key in i.ResponseHeaders.AllKeys)
                     {
-                        ctx.Response.Headers[key] = cache_entry.response_headers[key];
+                        ctx.Response.Headers[key] = i.ResponseHeaders[key];
                     }
                     ctx.Response.Headers["X-Cache"] = "HIT";
                     ctx.Response.Headers["X-Age"] = Math.Round((DateTime.Now - i.DateAdded).TotalSeconds).ToString();
-                    ctx.Response.BinaryWrite(cache_entry.body.ToArray());
+                    ctx.Response.BinaryWrite(i.Body.ToArray());
                     var requestStart = (DateTime)HttpContext.Current.Items["WeAmp.ScriptCache.RequestStart"];
                     Log.WriteLine("Handled cached request in {0} ms: [{1}]", (DateTime.Now - requestStart).TotalMilliseconds.ToString(), query);
                     HttpContext.Current.ApplicationInstance.CompleteRequest();
                     return;
-                } else
+                }
+                else
                 {
                     Log.WriteLine("Rember recently failed or skipped recording for [{0}]", query);
                 }
@@ -415,10 +599,11 @@ setTimeout('document.reload()', 5);
                 Log.WriteLine("script_ == null, return null");
                 return null;
             }
-            lock(configLock)
+            lock (configLock)
             {
-                int r=-99999999;
-                try { 
+                int r = -99999999;
+                try
+                {
                     r = (int)script_.GetMethod("OnRequest").Invoke(null, null);
                     Log.WriteLine("OnRequest TTL: " + r.ToString());
                 }
@@ -481,50 +666,50 @@ setTimeout('document.reload()', 5);
                 if (!failed_)
                 {
                     CacheItem i = new CacheItem(key_);
-                    ScriptableCacheResponseEntry e = new ScriptableCacheResponseEntry();
-                    e.status = 200;
-                    e.body = buffer_;
-                    e.response_headers = response_headers_;
+                    i.Status = 200;
+                    i.Body = buffer_;
+                    i.ResponseHeaders = response_headers_;
                     response_headers_.Remove("last-modified");
                     response_headers_.Remove("etag");
                     response_headers_.Remove("authorization");
                     response_headers_.Remove("cookie");
                     response_headers_.Remove("set-cookie");
                     response_headers_.Remove("set-cookie2");
-                    i.Value = e;
+
                     CacheItemPolicy p = new CacheItemPolicy();
                     p.AbsoluteExpiration = DateTime.Now.Add(new TimeSpan(0, 0, config_.TTL));
                     FilterLog(string.Format("Add to cache, TTL: {0}, valid through: {1}", config_.TTL, p.AbsoluteExpiration.ToString()));
                     cache_.Add(i, p);
                     ++Statistics.CacheItemsAdded;
                     buffer_ = null;
-                } else
+                }
+                else
                 {
-                    if (tested_) { 
+                    if (tested_)
+                    {
                         FilterLog("Mark recording as failed in cache because failed_ is set");
                         ++Statistics.FailedRecordings;
 
                         CacheItem i = new CacheItem(key_);
-                        ScriptableCacheResponseEntry e = new ScriptableCacheResponseEntry();
-                        e.status = 501;
-                        i.Value = e;
+                        i.Status = 501;
 
                         CacheItemPolicy p = new CacheItemPolicy();
                         p.AbsoluteExpiration = DateTime.Now.Add(new TimeSpan(0, 0, 300));
                         cache_.Add(i, p);
                     }
                 }
-            } else if (tested_) {
+            }
+            else if (tested_)
+            {
                 ++Statistics.DeclinedRecordings;
                 FilterLog("Mark recording as failed in cache because should_record_ is not set based on response headers");
                 CacheItem i = new CacheItem(key_);
-                ScriptableCacheResponseEntry e = new ScriptableCacheResponseEntry();
-                e.status = 502;
-                i.Value = e;
+                i.Status = 502;
                 CacheItemPolicy p = new CacheItemPolicy();
                 p.AbsoluteExpiration = DateTime.Now.Add(new TimeSpan(0, 0, 300));
                 cache_.Add(i, p);
-            } else
+            }
+            else
             {
                 ++Statistics.AbortedRecordings;
                 FilterLog("Skip recording that was aborted early / not started");
@@ -582,7 +767,8 @@ setTimeout('document.reload()', 5);
         {
             FilterLog("Close()");
             skip_record_ = true;
-            if (buffer_.Count> 0 ) { 
+            if (buffer_.Count > 0)
+            {
                 _sink.Write(buffer_.ToArray(), 0, buffer_.Count);
             }
             _sink.Flush();
@@ -613,17 +799,18 @@ setTimeout('document.reload()', 5);
                 lock (ScriptableCacheHttpModule.configLock)
                 {
                     bool script_cacheable = false;
-                    try {
+                    try
+                    {
                         script_cacheable = (bool)ScriptableCacheHttpModule.script_.GetMethod("OnResponse").Invoke(null, null);
                     }
-                    catch(Exception ex)
+                    catch (Exception ex)
                     {
                         ++Statistics.OnResponseExcepted;
                         script_cacheable = false;
                         FilterLog(string.Format("OnResponse call excepted: {0}", ex.ToString()));
                     }
                     FilterLog(string.Format("Scripted cachability: {0}, Response status: {1}", script_cacheable.ToString(), ctx.Response.StatusCode.ToString()));
-                    should_record_ = script_cacheable 
+                    should_record_ = script_cacheable
                         && ctx.Response.StatusCode == 200;
                 }
 
@@ -641,13 +828,16 @@ setTimeout('document.reload()', 5);
             {
                 FilterLog("Write: " + offset.ToString() + " (" + count.ToString() + ") " + buffer.GetHashCode().ToString());
                 int written = 0;
-                for (int i = offset; written < count; i++, written++) {
+                for (int i = offset; written < count; i++, written++)
+                {
                     buffer_.Add(buffer[i]);
                 }
             }
-            if (!should_record_) {
+            if (!should_record_)
+            {
                 _sink.Write(buffer, offset, count);
             }
         }
     }
 }
+
