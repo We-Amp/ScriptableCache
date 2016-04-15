@@ -93,20 +93,29 @@ namespace WeAmp.ScriptableCacheModule
 
         private static void ProccessUrl(string key)
         {
-            var webClient = new System.Net.WebClient();
-            string enc = key.Substring(0, key.IndexOf(':'));
-            string url = key.Substring(key.IndexOf(':') + 1);
-            Log.WriteLine("Background fetch starting for: " + key);
-            webClient.Headers["Accept-Encoding"] = enc;
-            webClient.Headers["BGFETCH"] = "1";
-            string data = webClient.DownloadString(url);
-            Log.WriteLine("Background fetch finished for: " + key);
+            try {
+                var webClient = new System.Net.WebClient();
+                string enc = key.Substring(0, key.IndexOf(':'));
+                string url = key.Substring(key.IndexOf(':') + 1);
+                Log.WriteLine("Background fetch starting for: " + key);
+                webClient.Headers["Accept-Encoding"] = enc;
+                webClient.Headers["BGFETCH"] = "1";
+                string data = webClient.DownloadString(url);
+                ++Statistics.BackgroundFetchSuccessCount;
+                Log.WriteLine("Background fetch finished for: " + key);
+            }
+            catch (Exception ex)
+            {
+                Log.WriteLine("Background fetch failed: " + ex.Message);
+                ++Statistics.BackgroundFetchErrorCount;
+
+            } 
         }
     }
     public static class Log
     {
         static DateTime start = DateTime.Now;
-        static CircularBuffer<string> Buffer = new CircularBuffer<string>(10);
+        static CircularBuffer<string> Buffer = new CircularBuffer<string>(4000);
         static object bufferLock_ = new { };
         public static void WriteLine(string fmt, params string[] args)
         {
@@ -124,7 +133,8 @@ namespace WeAmp.ScriptableCacheModule
                 lines = Buffer.ToArray();
             for (int i = lines.Length - 1; i >= 0; --i)
             {
-                sb.AppendLine(lines[i]);
+                if (!string.IsNullOrEmpty(lines[i]))
+                    sb.AppendLine(lines[i]);
             }
             return sb.ToString();
         }
@@ -189,7 +199,7 @@ namespace WeAmp.ScriptableCacheModule
 
         private static void Lru__ItemRemoved(KeyValuePair<string, CacheItem> obj)
         {
-            ++Statistics.CacheItemsEvicted;
+            ++Statistics.LruEvictions;
             Log.WriteLine("Cache entry evicted: " + obj.Key + "(" + obj.Value.Status.ToString() + ")");
         }
 
@@ -206,7 +216,7 @@ namespace WeAmp.ScriptableCacheModule
             lru_.AddOrUpdate(i.Key, i, kvu);
             if (memc_ != null)
             {
-                bool memc_set_result = memc_.Set(i.Key, i, i.ValidUntil - DateTime.Now);
+                bool memc_set_result = memc_.Set(Uri.EscapeDataString(i.Key), i, i.ValidUntil - DateTime.Now);
                 Log.WriteLine("Add [{0}] for {3} => MemC:{1} (cache has {2} items)", i.Key, memc_set_result.ToString(), lru_.Count.ToString(), (i.ValidUntil - DateTime.Now).ToString());
             }
         }
@@ -215,8 +225,11 @@ namespace WeAmp.ScriptableCacheModule
             CacheItem v;
             if (lru_.TryGetValue(key, out v))
             {
+                ++Statistics.LruHits;
+
                 if (v.Status == 404)
                 {
+                    // TODO(oschaaf): 404 is dead
                     if (DateTime.Now >= v.ValidUntil)
                     {
                         lru_.TryRemove(key, out v);
@@ -224,7 +237,8 @@ namespace WeAmp.ScriptableCacheModule
 
                     Log.WriteLine("LRU found [{0}] 404 for backend", key);
                     return null;
-                } else if (DateTime.Now >= v.ValidUntil)
+                }
+                else if (DateTime.Now >= v.ValidUntil)
                 {
                     Log.WriteLine("LRU found [{0}] but {1} >= {2}", key, DateTime.Now.ToString(), v.ValidUntil.ToString());
 
@@ -238,29 +252,42 @@ namespace WeAmp.ScriptableCacheModule
                 {
                     FetchQueue.Add(v.Key);
                     return v;
-                } else
-
-                Log.WriteLine("LRU found [{0}] 200/OK", key);
+                }
+                else { 
+                    Log.WriteLine("LRU found [{0}] 200/OK", key);
+                }
                 return v;
             }
-            else if (memc_ != null)
-            {
-                v = (CacheItem)memc_.Get(key);
-                if (v != null)
+            else {
+                ++Statistics.LruMisses;
+                Log.WriteLine("LRU Miss [{0}]", key);
+
+                if (memc_ != null)
                 {
-                    bool addres = lru_.TryAdd(key, v);
-                    Log.WriteLine("Memcached found [{0}] - prop. to LRU: {1}", key, addres.ToString());
-                    return v;
-                }
-                else
-                {/*
-                    v = new CacheItem(key);
-                    CacheItemPolicy p = new CacheItemPolicy();
-                    p.AbsoluteExpiration = DateTime.Now.Add(new TimeSpan(0, 5, 0)); 
-                    v.Status = 404;
-                    bool lrustatus = lru_.TryAdd(v.Key, v);
-                    Log.WriteLine("Memcached entry not found [{0}] (marked as 404 in LRU -> )", key, lrustatus.ToString());
-                    return null;*/
+                    // TODO(oschaaf): must encode key. 
+                    // try http://localhost:81/search/go?lbc=overland&method=and&p=Q&ts=custom&uid=90289775&w=leather%20jacket&af=mat1%3aleather%20department%3acoatsouterwear
+                    v = (CacheItem)memc_.Get(Uri.EscapeDataString(key));
+                    if (v != null)
+                    {
+                        bool addres = lru_.TryAdd(key, v);
+                        ++Statistics.MemcachedHits;
+                        Log.WriteLine("Memcached found [{0}] - prop. to LRU: {1}", key, addres.ToString());
+                        return v;
+                    }
+                    else
+                    {
+                        ++Statistics.MemcachedMisses;
+                        Log.WriteLine("Memcached Miss [{0}] - prop", key);
+
+                        /*
+                        v = new CacheItem(key);
+                        CacheItemPolicy p = new CacheItemPolicy();
+                        p.AbsoluteExpiration = DateTime.Now.Add(new TimeSpan(0, 5, 0)); 
+                        v.Status = 404;
+                        bool lrustatus = lru_.TryAdd(v.Key, v);
+                        Log.WriteLine("Memcached entry not found [{0}] (marked as 404 in LRU -> )", key, lrustatus.ToString());
+                        return null;*/
+                    }
                 }
             }
             return null;
@@ -295,7 +322,13 @@ namespace WeAmp.ScriptableCacheModule
         internal static int CacheItemsAdded;
         internal static int OnResponseExcepted;
         internal static int RecordingsStarted;
-        internal static int CacheItemsEvicted;
+        internal static int LruEvictions;
+        internal static int MemcachedHits;
+        internal static int MemcachedMisses;
+        internal static int BackgroundFetchSuccessCount;
+        internal static int BackgroundFetchErrorCount;
+        internal static int LruMisses;
+        internal static int LruHits;
     }
 
     public class ScriptableCacheHttpModule : IHttpModule
@@ -441,7 +474,6 @@ namespace WeAmp.ScriptableCacheModule
 
         private void App_BeginRequest(object sender, EventArgs e)
         {
-            ++Statistics.TotalRequests;
 
             var app = (HttpApplication)sender;
             var ctx = app.Context;
@@ -471,8 +503,7 @@ setTimeout('document.reload()', 5);
                 HttpContext.Current.Response.Write(string.Format(template, Log.GetLog()));
                 HttpContext.Current.ApplicationInstance.CompleteRequest();
                 return;
-            }
-            else if (query.Contains("/WeAmp.ScriptCache.Purge"))
+            } else if (query.Contains("/WeAmp.ScriptCache.Purge"))
             {
                 Log.WriteLine("Executing purge");
                 cache_.PurgeAll();
@@ -482,32 +513,49 @@ setTimeout('document.reload()', 5);
                 ++Statistics.PurgesProcessed;
                 HttpContext.Current.ApplicationInstance.CompleteRequest();
                 return;
-            }
-            else
-          if (query.EndsWith("/Weamp.ScriptCache.Stats"))
+            } else if (query.EndsWith("/Weamp.ScriptCache.Stats"))
             {
 
                 string s = "";
+                s += "<h3>App statistics</h3>";
                 s += "Total Requests seen: " + Statistics.TotalRequests + "\n";
-                s += "Cache Hits: " + Statistics.Hits + "\n";
-                s += "Cache Misses: " + Statistics.Misses + "\n";
                 s += "Entries currently in cache: " + MemoryCache.GetApproxItemCount().ToString() + "\n";
                 s += "Total cache items added: " + Statistics.CacheItemsAdded + "\n";
-                s += "Total cache items evicted: " + Statistics.CacheItemsEvicted + "\n";
+
+                s += "<h3>Cache health</h3>";
+                s += "Cache Hits: " + Statistics.Hits + "\n";
+                s += "Cache Misses: " + Statistics.Misses + "\n";
+                s += "LRU Hits: " + Statistics.LruHits + "\n";
+                s += "LRU Misses: " + Statistics.LruMisses + "\n";
+                s += "LRU Evictions: " + Statistics.LruEvictions + "\n";
+                s += "MemcachedCache Hits: " + Statistics.MemcachedHits + "\n";
+                s += "MemcachedCache Misses: " + Statistics.MemcachedMisses + "\n";
+                s += "Background fetch success count: " + Statistics.BackgroundFetchSuccessCount + "\n";
+                s += "Background fetch error count: " + Statistics.BackgroundFetchErrorCount + "\n";
+
+                s += "<h3>Output statistics</h3>";
                 s += "Uncacheable requests seen: " + Statistics.Uncacheable + "\n";
+                s += "Initiated cache recordings: " + Statistics.RecordingsStarted + "\n";
+                s += "Failed cache recordings: " + Statistics.FailedRecordings + "\n";
+                s += "Declined cache recordings: " + Statistics.DeclinedRecordings + "\n";
+                s += "Aborted cache  recordings: " + Statistics.AbortedRecordings + "\n";
+
+                s += "<h3>Module health</h3>";
                 s += "Config Reloads: " + Statistics.ConfigReloads + "\n";
                 s += "Cache Purge requests Processed: " + Statistics.PurgesProcessed + "\n";
                 s += "Application error events fired: " + Statistics.AppErrorsFired + "\n";
                 s += "OnRequest calls Excepted: " + Statistics.OnRequestExcepted + "\n";
                 s += "OnResponse calls Excepted: " + Statistics.OnResponseExcepted + "\n";
-                s += "Initiated cache recordings: " + Statistics.RecordingsStarted + "\n";
-                s += "Failed cache recordings: " + Statistics.FailedRecordings + "\n";
-                s += "Declined cache recordings: " + Statistics.DeclinedRecordings + "\n";
-                s += "Aborted cache  recordings: " + Statistics.AbortedRecordings + "\n";
+
+
+
                 HttpContext.Current.Response.ContentType = "text/html";
                 HttpContext.Current.Response.Write(string.Format(template, s));
                 HttpContext.Current.ApplicationInstance.CompleteRequest();
                 return;
+            } else
+            {
+                ++Statistics.TotalRequests;
             }
 
 
@@ -527,6 +575,7 @@ setTimeout('document.reload()', 5);
             if (!is_background)
             foreach (string enc in new string[] { "br", "gzip", "" })
             {
+              
                 string senc = enc.Trim();
                 if (string.IsNullOrEmpty(senc))
                 {
@@ -558,6 +607,8 @@ setTimeout('document.reload()', 5);
                     ctx.Response.BinaryWrite(i.Body.ToArray());
                     var requestStart = (DateTime)HttpContext.Current.Items["WeAmp.ScriptCache.RequestStart"];
                     Log.WriteLine("Handled cached request in {0} ms: [{1}]", (DateTime.Now - requestStart).TotalMilliseconds.ToString(), query);
+                    //ctx.Response.Cache.SetCacheability(HttpCacheability.ServerAndNoCache);
+                    //ctx.Response.ExpiresAbsolute = i.ValidUntil;
                     HttpContext.Current.ApplicationInstance.CompleteRequest();
                     return;
                 }
@@ -699,7 +750,7 @@ setTimeout('document.reload()', 5);
                     }
                 }
             }
-            else if (tested_)
+            else if (tested_ && !failed_)
             {
                 ++Statistics.DeclinedRecordings;
                 FilterLog("Mark recording as failed in cache because should_record_ is not set based on response headers");
@@ -808,6 +859,7 @@ setTimeout('document.reload()', 5);
                         ++Statistics.OnResponseExcepted;
                         script_cacheable = false;
                         FilterLog(string.Format("OnResponse call excepted: {0}", ex.ToString()));
+                        throw;
                     }
                     FilterLog(string.Format("Scripted cachability: {0}, Response status: {1}", script_cacheable.ToString(), ctx.Response.StatusCode.ToString()));
                     should_record_ = script_cacheable
